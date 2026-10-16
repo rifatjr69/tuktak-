@@ -74,7 +74,11 @@ export const Footer: React.FC = () => {
           </div>
 
           <p className="text-xs sm:text-sm text-gray-500 leading-relaxed font-sans max-w-sm">
-            {settings.tagline_bn} — খাঁটি মসলা, নাটস, ড্রাই ফ্রুটস এবং অর্গানিক খাদ্যপণ্যের বিশ্বস্ত অনলাইন শপ।
+            {settings.tagline_bn}🏡✨ **DIY Miniature House, Kids’ Items, Stationery, Home & Lifestyle এবং আধুনিক Gadgets-এর বিশ্বস্ত অনলাইন শপ!** 🎨🧸📚
+
+💖 আপনার দৈনন্দিন জীবনকে আরও আনন্দময়, সুন্দর ও সহজ করতে পছন্দের সব পণ্য এখন এক ঠিকানায়! 🛍️🌈
+
+🎁 পছন্দের পণ্য কিনুন, জীবনকে সাজান নিজের মতো করে! 💫
           </p>
 
           <div className="space-y-1.5 text-xs text-gray-600">
@@ -88,7 +92,7 @@ export const Footer: React.FC = () => {
             </div>
             <div className="flex items-center gap-2">
               <MapPin className="w-4 h-4 text-[#185824]" />
-              <span>House 42, Road 11, Banani, Dhaka, Bangladesh</span>
+              <span>Dhaka mirpur, pallabi, eastern housing</span>
             </div>
           </div>
         </div>
