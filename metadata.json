@@ -1,0 +1,6 @@
+{
+  "name": "Tuktak Shopping",
+  "description": "Tuktak Shopping - Premium organic herbs, spices, nuts, dry fruits, and kitchen essentials with cash on delivery nationwide.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
