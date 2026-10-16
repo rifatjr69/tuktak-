@@ -72,7 +72,7 @@ export const INITIAL_SITE_SETTINGS: SiteSettings = {
   extra_discount_percent: 5,
   site_name: 'Tuktak Shopping',
   tagline_en: 'PURE & ORGANIC ESSENTIALS',
-  tagline_bn: 'খাঁটি ও প্রাকৃতিক পণ্যের বিশ্বস্ত অনলাইন শপ',
+  tagline_bn: 'tuktakshopping.netlify.app',
   flash_sale_end_time: new Date(Date.now() + 937 * 3600 * 1000 + 2 * 60 * 1000 + 7 * 1000).toISOString(),
 };
 
