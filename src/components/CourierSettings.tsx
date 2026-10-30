@@ -87,6 +87,10 @@ export const CourierSettings: React.FC<{ showToast: (m: string) => void }> = ({ 
 
   useEffect(() => {
     (async () => {
+      if (!supabase) {
+        setLoading(false);
+        return;
+      }
       const { data, error } = await supabase.from('courier_settings').select('*');
       if (error) showToast('কুরিয়ার সেটিংস লোড হয়নি: ' + error.message);
       const next = emptyRows();
@@ -111,6 +115,7 @@ export const CourierSettings: React.FC<{ showToast: (m: string) => void }> = ({ 
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!supabase) return showToast('Supabase সংযুক্ত নেই');
     setSaving(true);
     const payload = (Object.keys(rows) as CourierId[]).map((id) => ({
       provider: id,
@@ -270,6 +275,7 @@ export const SendToCourierButton: React.FC<{
 
   useEffect(() => {
     (async () => {
+      if (!supabase) return;
       const { data } = await supabase.from('courier_settings').select('provider,is_default').eq('enabled', true);
       const list = (data || []).map((r: any) => ({ id: r.provider as CourierId, is_default: r.is_default }));
       setEnabled(list);
@@ -288,7 +294,7 @@ export const SendToCourierButton: React.FC<{
   }
 
   const send = async () => {
-    if (!selected || sending) return;
+    if (!selected || sending || !supabase) return;
     setSending(true);
     try {
       const { data: sess } = await supabase.auth.getSession();

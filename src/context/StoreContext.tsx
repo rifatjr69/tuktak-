@@ -61,12 +61,15 @@ interface StoreContextType {
 
   // Order & Tracking
   orders: Order[];
+  isOrdersSyncing: boolean;
+  refreshOrders: (silent?: boolean) => Promise<void>;
   isTrackOrderOpen: boolean;
   trackOrderQuery: string;
   openTrackOrder: (orderNumber?: string) => void;
   closeTrackOrder: () => void;
   setTrackOrderQuery: (q: string) => void;
   placeOrder: (orderData: Omit<Order, 'id' | 'order_number' | 'created_at'>) => Promise<Order>;
+  updateOrder: (updatedOrder: Order) => Promise<boolean>;
   updateOrderStatus: (orderId: string, status: OrderStatus, courierId?: string) => void;
   deleteOrder: (orderId: string) => Promise<void>;
 
@@ -111,6 +114,18 @@ const generateUUID = () => {
     return v.toString(16);
   });
 };
+
+const isValidUUID = (val?: string | null): boolean =>
+  Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+
+const generateOrderNumber = (): string => {
+  const timePart = Date.now().toString().slice(-6);
+  const randPart = Math.floor(10 + Math.random() * 90);
+  return `TK-${timePart}${randPart}`;
+};
+
+const isLegacyDemoOrder = (o: Order): boolean =>
+  o.id.startsWith('ord-100') || o.order_number === 'LH-1001' || o.order_number === 'LH-1002';
 
 export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // Products (Automatically purges legacy mock demo items)
@@ -185,22 +200,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [isTrackOrderOpen, setIsTrackOrderOpen] = useState(false);
   const [trackOrderQuery, setTrackOrderQuery] = useState('');
 
-  // Orders (Purges legacy mock demo orders)
+  // Orders (Purges legacy mock demo orders while keeping real customer orders)
   const [orders, setOrders] = useState<Order[]>(() => {
     try {
       const saved = localStorage.getItem('littlehug_orders');
       if (saved) {
         const parsed: Order[] = JSON.parse(saved);
-        const cleaned = parsed.filter(
-          (o) => !o.id.startsWith('ord-100') && !o.order_number?.startsWith('LH-100')
-        );
-        return cleaned;
+        return parsed.filter((o) => !isLegacyDemoOrder(o));
       }
     } catch {
       // ignore
     }
     return INITIAL_ORDERS;
   });
+  const [isOrdersSyncing, setIsOrdersSyncing] = useState(false);
 
   // Auth & Admin state
   // Notice: Role is NEVER trusted blindly from localStorage!
@@ -276,7 +289,54 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [user]);
 
-  // Fetch initial data from Supabase if configured so all devices sync
+  // Fetch orders from Supabase (merges local guest orders for non-admins, authoritative DB list for admins)
+  const refreshOrders = useCallback(async (silent = true) => {
+    if (!isSupabaseConfigured || !supabase) return;
+    if (!silent) setIsOrdersSyncing(true);
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const sessionUser = sessionData?.session?.user || null;
+
+      const { data, error } = await supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.warn('Supabase orders fetch error:', error);
+        if (!silent) showToast(`অর্ডার লোড ত্রুটি: ${error.message}`);
+        return;
+      }
+
+      if (data) {
+        const dbOrders: Order[] = data.map((ord: any) => ({
+          ...ord,
+          items: ord.order_items || [],
+        }));
+
+        if (isAdmin && sessionUser) {
+          // Verified Admin gets authoritative cross-device order list from Supabase
+          setOrders(dbOrders);
+        } else if (dbOrders.length > 0) {
+          // Guest or regular customer: merge DB-returned orders with locally placed guest orders
+          setOrders((prev) => {
+            const dbIds = new Set(dbOrders.map((o) => o.id));
+            const dbNums = new Set(dbOrders.map((o) => o.order_number));
+            const localOnly = prev.filter(
+              (o) => !isLegacyDemoOrder(o) && !dbIds.has(o.id) && !dbNums.has(o.order_number)
+            );
+            return [...dbOrders, ...localOnly];
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Error refreshing orders:', err);
+    } finally {
+      if (!silent) setIsOrdersSyncing(false);
+    }
+  }, [isAdmin, showToast]);
+
+  // Fetch initial storefront data (categories, products, settings) from Supabase so all devices sync
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) return;
     const client = supabase;
@@ -284,7 +344,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     Promise.all([
       client.from('categories').select('*').order('sort_order', { ascending: true }),
       client.from('products').select('*').order('created_at', { ascending: false }),
-    ]).then(([catRes, prodRes]) => {
+      client.from('site_settings').select('key, value'),
+    ]).then(([catRes, prodRes, setRes]) => {
       let currentCats = categories;
       if (!catRes.error && catRes.data) {
         currentCats = catRes.data;
@@ -296,39 +357,46 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setProducts(enriched);
         localStorage.setItem('littlehug_products', JSON.stringify(enriched));
       }
-    });
-
-    const refreshOrders = () => {
-      client
-        .from('orders')
-        .select('*, order_items(*)')
-        .order('created_at', { ascending: false })
-        .then(({ data, error }) => {
-          if (!error && data) {
-            const formattedOrders = data.map((ord: any) => ({
-              ...ord,
-              items: ord.order_items || [],
-            }));
-            setOrders(formattedOrders);
-            localStorage.setItem('littlehug_orders', JSON.stringify(formattedOrders));
-          }
+      if (!setRes.error && setRes.data && setRes.data.length > 0) {
+        const dbSettings: Record<string, any> = {};
+        setRes.data.forEach((row: { key: string; value: any }) => {
+          dbSettings[row.key] = row.value;
         });
-    };
+        setSettings((prev) => ({ ...prev, ...dbSettings }));
+      }
+    });
+  }, []);
 
-    refreshOrders();
+  // Re-fetch orders & subscribe to Realtime changes whenever auth/admin state or dashboard visibility changes
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+    const client = supabase;
 
-    // Realtime listener for order changes
+    refreshOrders(true);
+
     const orderSubscription = client
-      .channel('schema-db-changes')
+      .channel(`orders-sync-${user?.id || 'guest'}-${isAdmin ? 'admin' : 'user'}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, () => {
-        refreshOrders();
+        refreshOrders(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'order_items' }, () => {
+        refreshOrders(true);
       })
       .subscribe();
 
+    // Poll every 12s while Admin Dashboard is open so cross-device orders appear even if Realtime replication is off
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    if (isAdmin && isAdminDashboardOpen) {
+      pollTimer = setInterval(() => {
+        refreshOrders(true);
+      }, 12000);
+    }
+
     return () => {
       client.removeChannel(orderSubscription);
+      if (pollTimer) clearInterval(pollTimer);
     };
-  }, []);
+  }, [user?.id, isAdmin, isAdminDashboardOpen, refreshOrders]);
 
   // Strict Database Role Verification and Session Listener
   const verifySessionUser = useCallback(async (sessionUser: any) => {
@@ -454,17 +522,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [user?.id, user?.email, isAdminDashboardOpen]);
 
-  // Re-verify role whenever window regains focus (e.g. after modifying role in Supabase tab)
+  // Re-verify role & refresh orders whenever window regains focus or tab becomes visible
   useEffect(() => {
     const handleWindowFocus = () => {
       refreshUserRole();
+      refreshOrders(true);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        refreshOrders(true);
+      }
     };
 
     window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [refreshUserRole]);
+  }, [refreshUserRole, refreshOrders]);
 
   // Cart operations
   const addToCart = (product: Product, quantity = 1, variant?: string) => {
@@ -562,77 +638,106 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setIsTrackOrderOpen(false);
   };
 
-  // Place order (Anyone can place orders)
+  // Place order (Anyone — unauthenticated mobile guest or logged-in customer — can place orders)
   const placeOrder = async (
     orderData: Omit<Order, 'id' | 'order_number' | 'created_at'>
   ): Promise<Order> => {
-    const nextSeq = 1000 + orders.length + 1;
-    const orderNumber = `LH-${nextSeq}`;
+    const orderId = generateUUID();
+    const orderNumber = generateOrderNumber();
+    const createdAt = new Date().toISOString();
+
     const newOrder: Order = {
       ...orderData,
-      id: `ord-${Date.now()}`,
+      id: orderId,
       order_number: orderNumber,
-      created_at: new Date().toISOString(),
+      created_at: createdAt,
     };
 
-    // If Supabase is configured, write order to Supabase
+    // Write order & order_items to Supabase WITHOUT .select() so guest/anon users never fail SELECT RLS
     if (isSupabaseConfigured && supabase) {
+      let verifiedUserId: string | null = null;
       try {
-        const { data: insertedOrder, error: orderErr } = await supabase
-          .from('orders')
-          .insert({
-            order_number: newOrder.order_number,
-            user_id: user?.id || null, // Link to authenticated customer if logged in
-            customer_name: newOrder.customer_name,
-            phone: newOrder.phone,
-            address: newOrder.address,
-            delivery_zone: newOrder.delivery_zone,
-            delivery_charge: newOrder.delivery_charge,
-            subtotal: newOrder.subtotal,
-            discount: newOrder.discount,
-            total: newOrder.total,
-            coupon_code: newOrder.coupon_code || null,
-            payment_method: 'COD',
-            status: 'pending',
-          })
-          .select()
-          .single();
+        const { data: sessionRes } = await supabase.auth.getSession();
+        const sessionUid = sessionRes?.session?.user?.id;
+        if (isValidUUID(sessionUid)) {
+          verifiedUserId = sessionUid!;
+        }
+      } catch {
+        verifiedUserId = null;
+      }
 
-        if (orderErr) {
-          console.error('Supabase order insert error:', orderErr);
-        } else if (insertedOrder) {
-          newOrder.id = insertedOrder.id;
-          newOrder.order_number = insertedOrder.order_number;
+      const baseOrderRow = {
+        id: orderId,
+        order_number: orderNumber,
+        user_id: verifiedUserId,
+        customer_name: newOrder.customer_name,
+        phone: newOrder.phone,
+        address: newOrder.address,
+        delivery_zone: newOrder.delivery_zone,
+        delivery_charge: newOrder.delivery_charge,
+        subtotal: newOrder.subtotal,
+        discount: newOrder.discount,
+        total: newOrder.total,
+        coupon_code: newOrder.coupon_code || null,
+        payment_method: 'COD',
+        status: 'pending',
+      };
 
-          const isValidUUID = (val?: string | null) =>
-            Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+      // Insert order row (no .select() chained — avoids 42501 RLS violation on guest checkout!)
+      let { error: orderErr } = await supabase.from('orders').insert(baseOrderRow);
 
-          // Insert order items
-          const itemsToInsert = newOrder.items.map((it) => ({
-            order_id: insertedOrder.id,
-            product_id: isValidUUID(it.product_id) ? it.product_id : null,
-            product_name: it.product_name,
-            variant: it.variant || null,
-            quantity: it.quantity,
-            unit_price: it.unit_price,
-            total: it.total,
-          }));
+      // Fallback 1: in case of rare order_number collision or user_id FK mismatch, retry with fresh order_number & null user_id
+      if (orderErr) {
+        console.warn('Retrying Supabase order insert with fallback payload...', orderErr);
+        const retryOrderNumber = generateOrderNumber();
+        const retryOrderId = generateUUID();
+        const { error: retryErr } = await supabase.from('orders').insert({
+          ...baseOrderRow,
+          id: retryOrderId,
+          order_number: retryOrderNumber,
+          user_id: null,
+        });
+        if (!retryErr) {
+          newOrder.id = retryOrderId;
+          newOrder.order_number = retryOrderNumber;
+          orderErr = null;
+        } else {
+          orderErr = retryErr;
+        }
+      }
 
-          let { error: itemsErr } = await supabase.from('order_items').insert(itemsToInsert);
-          if (itemsErr) {
-            console.warn('Retrying order_items with product_id null fallback...', itemsErr);
-            const fallbackItems = itemsToInsert.map((it) => ({ ...it, product_id: null }));
-            await supabase.from('order_items').insert(fallbackItems);
+      if (orderErr) {
+        console.error('Supabase order insert failed:', orderErr);
+        throw new Error(orderErr.message || 'ডাটাবেজে অর্ডার সংরক্ষণ করা যায়নি');
+      }
+
+      // Insert order items linked to client-generated UUID
+      const itemsToInsert = newOrder.items.map((it) => ({
+        order_id: newOrder.id,
+        product_id: isValidUUID(it.product_id) ? it.product_id : null,
+        product_name: it.product_name,
+        variant: it.variant || null,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        total: it.total,
+      }));
+
+      if (itemsToInsert.length > 0) {
+        const { error: itemsErr } = await supabase.from('order_items').insert(itemsToInsert);
+        if (itemsErr) {
+          console.warn('Retrying order_items with product_id null fallback...', itemsErr);
+          const fallbackItems = itemsToInsert.map((it) => ({ ...it, product_id: null }));
+          const { error: fallbackItemsErr } = await supabase.from('order_items').insert(fallbackItems);
+          if (fallbackItemsErr) {
+            console.error('Supabase order_items insert error:', fallbackItemsErr);
           }
         }
-      } catch (err) {
-        console.warn('Supabase order insert fallback to local state:', err);
       }
     }
 
-    setOrders((prev) => [newOrder, ...prev]);
+    setOrders((prev) => [newOrder, ...prev.filter((o) => o.id !== newOrder.id)]);
 
-    // Update stock & sold count
+    // Update stock & sold count locally
     setProducts((prev) =>
       prev.map((p) => {
         const orderedItem = newOrder.items.find((it) => it.product_id === p.id);
@@ -691,6 +796,106 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       })
     );
     showToast(`অর্ডার স্ট্যাটাস আপডেট হয়েছে: ${status}`);
+  };
+
+  const updateOrder = async (updatedOrder: Order): Promise<boolean> => {
+    if (!isAdmin) {
+      showToast('অ্যাক্সেস অস্বীকৃত: অর্ডার সম্পাদনা করার জন্য অ্যাডমিন অনুমতি প্রয়োজন।');
+      return false;
+    }
+
+    const sanitizedItems = updatedOrder.items.map((it) => {
+      const qty = Math.max(1, Number(it.quantity) || 1);
+      const unitPrice = Math.max(0, Number(it.unit_price) || 0);
+      return {
+        ...it,
+        quantity: qty,
+        unit_price: unitPrice,
+        total: unitPrice * qty,
+      };
+    });
+
+    const normalizedOrder: Order = {
+      ...updatedOrder,
+      customer_name: updatedOrder.customer_name.trim(),
+      phone: updatedOrder.phone.trim(),
+      address: updatedOrder.address.trim(),
+      delivery_zone: updatedOrder.delivery_zone.trim(),
+      delivery_charge: Math.max(0, Number(updatedOrder.delivery_charge) || 0),
+      subtotal: Math.max(0, Number(updatedOrder.subtotal) || 0),
+      discount: Math.max(0, Number(updatedOrder.discount) || 0),
+      total: Math.max(0, Number(updatedOrder.total) || 0),
+      note: updatedOrder.note?.trim() || '',
+      courier_tracking_id: updatedOrder.courier_tracking_id?.trim() || '',
+      items: sanitizedItems,
+    };
+
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const orderUpdatePayload: Record<string, any> = {
+          customer_name: normalizedOrder.customer_name,
+          phone: normalizedOrder.phone,
+          address: normalizedOrder.address,
+          delivery_zone: normalizedOrder.delivery_zone,
+          delivery_charge: normalizedOrder.delivery_charge,
+          subtotal: normalizedOrder.subtotal,
+          discount: normalizedOrder.discount,
+          total: normalizedOrder.total,
+          status: normalizedOrder.status,
+          note: normalizedOrder.note || null,
+          courier_tracking_id: normalizedOrder.courier_tracking_id || null,
+          updated_at: new Date().toISOString(),
+        };
+
+        const { error: ordErr } = await supabase
+          .from('orders')
+          .update(orderUpdatePayload)
+          .eq('id', normalizedOrder.id);
+
+        if (ordErr) {
+          console.error('Error updating order in Supabase:', ordErr);
+          showToast(`ডাটাবেজ ত্রুটি: ${ordErr.message}`);
+          return false;
+        }
+
+        // Sync order_items in Supabase cleanly
+        const { error: delItemsErr } = await supabase
+          .from('order_items')
+          .delete()
+          .eq('order_id', normalizedOrder.id);
+
+        if (delItemsErr) {
+          console.warn('Warning deleting previous order_items during edit:', delItemsErr);
+        } else if (sanitizedItems.length > 0) {
+          const itemsPayload = sanitizedItems.map((it) => ({
+            order_id: normalizedOrder.id,
+            product_id: isValidUUID(it.product_id) ? it.product_id : null,
+            product_name: it.product_name,
+            variant: it.variant || null,
+            quantity: it.quantity,
+            unit_price: it.unit_price,
+            total: it.total,
+          }));
+
+          const { error: insItemsErr } = await supabase.from('order_items').insert(itemsPayload);
+          if (insItemsErr) {
+            console.warn('Retrying edited order_items insert with null product_id...', insItemsErr);
+            const fallbackPayload = itemsPayload.map((row) => ({ ...row, product_id: null }));
+            await supabase.from('order_items').insert(fallbackPayload);
+          }
+        }
+      } catch (err) {
+        console.warn('Error updating order in Supabase:', err);
+        showToast('অর্ডার ডাটাবেজে আপডেট করতে সমস্যা হয়েছে');
+        return false;
+      }
+    }
+
+    setOrders((prev) =>
+      prev.map((ord) => (ord.id === normalizedOrder.id ? normalizedOrder : ord))
+    );
+    showToast(`✓ অর্ডার (${normalizedOrder.order_number}) সফলভাবে আপডেট ও সেভ করা হয়েছে!`);
+    return true;
   };
 
   const deleteOrder = async (orderId: string) => {
@@ -1037,9 +1242,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return cleaned;
     });
     setOrders((prev) => {
-      const cleaned = prev.filter(
-        (o) => !o.id.startsWith('ord-100') && !o.order_number?.startsWith('LH-100')
-      );
+      const cleaned = prev.filter((o) => !isLegacyDemoOrder(o));
       localStorage.setItem('littlehug_orders', JSON.stringify(cleaned));
       return cleaned;
     });
@@ -1167,12 +1370,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         openProductDetail,
         closeProductDetail,
         orders,
+        isOrdersSyncing,
+        refreshOrders,
         isTrackOrderOpen,
         trackOrderQuery,
         openTrackOrder,
         closeTrackOrder,
         setTrackOrderQuery,
         placeOrder,
+        updateOrder,
         updateOrderStatus,
         deleteOrder,
         user,

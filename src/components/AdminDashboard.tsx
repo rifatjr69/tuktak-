@@ -2,10 +2,10 @@ import React, { useEffect, useId, useState } from 'react';
 import {
   X, Package, ShoppingBag, Sliders, Database, Edit2, Trash2, Plus, Save, Copy, FolderPlus, Tag,
   Check, ArrowLeft, LogOut, Phone, MessageCircle, Search, Printer, Upload, Loader2,
-  Image as ImageIcon, Activity, Truck, Eye, EyeOff, KeyRound, TrendingUp, Clock, PackageCheck,
+  Image as ImageIcon, Activity, Truck, Eye, EyeOff, KeyRound, TrendingUp, Clock, PackageCheck, RefreshCw, Minus,
 } from 'lucide-react';
 import { useStore } from '../context/StoreContext';
-import { OrderStatus, Product, Order } from '../types';
+import { OrderStatus, Product, Order, OrderItem } from '../types';
 import { isSupabaseConfigured, uploadImageToSupabase } from '../lib/supabase';
 import { isProductMatchingCategory } from '../lib/categoryUtils';
 import { BannerManager } from './BannerManager';
@@ -291,8 +291,8 @@ type TabKey = 'orders' | 'products' | 'banners' | 'courier' | 'tracking' | 'sett
 
 export const AdminDashboard: React.FC = () => {
   const {
-    isAdminDashboardOpen, closeAdminDashboard, orders, updateOrderStatus, deleteOrder, products,
-    updateProduct, addProduct, deleteProduct, categories, addCategory, deleteCategory, settings,
+    isAdminDashboardOpen, closeAdminDashboard, orders, isOrdersSyncing, refreshOrders, updateOrder, updateOrderStatus, deleteOrder, products,
+    updateProduct, addProduct, deleteProduct, categories, addCategory, deleteCategory, deliveryZones, settings,
     updateSettings, user, isAdmin, refreshUserRole, logout, showToast, clearAllDemoData,
   } = useStore();
 
@@ -301,6 +301,10 @@ export const AdminDashboard: React.FC = () => {
   const [orderStatusFilter, setOrderStatusFilter] = useState<string>('all');
   const [orderSearchQuery, setOrderSearchQuery] = useState('');
   const [viewInvoiceOrder, setViewInvoiceOrder] = useState<Order | null>(null);
+  const [editingOrder, setEditingOrder] = useState<Order | null>(null);
+  const [customOrderTotal, setCustomOrderTotal] = useState<number | null>(null);
+  const [isSavingOrder, setIsSavingOrder] = useState(false);
+  const [addItemProductId, setAddItemProductId] = useState<string>('');
   const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
 
   const [productCategoryFilter, setProductCategoryFilter] = useState<string>('all');
@@ -360,11 +364,37 @@ export const AdminDashboard: React.FC = () => {
   }
   if (!isAdminDashboardOpen) return null;
 
+  const resolveOrderItemDetails = (it: OrderItem) => {
+    const matched = products.find(
+      (p) =>
+        (it.product_id && p.id === it.product_id) ||
+        p.name.trim().toLowerCase() === (it.product_name || '').trim().toLowerCase() ||
+        p.name_bn.trim().toLowerCase() === (it.product_name || '').trim().toLowerCase()
+    );
+    const imgUrl = it.image_url || matched?.image_url || matched?.images?.[0] || DEFAULT_PRODUCT_IMAGE;
+    const secondaryName =
+      matched?.name_bn && matched.name_bn.trim() !== it.product_name.trim() ? matched.name_bn : '';
+    return { matched, imgUrl, secondaryName };
+  };
+
+  const openEditOrderModal = (ord: Order) => {
+    const clonedItems = (ord.items || []).map((it) => ({ ...it }));
+    const calcSub = clonedItems.reduce((s, i) => s + Number(i.unit_price || 0) * Number(i.quantity || 1), 0);
+    const calcTotal = Math.max(0, calcSub + Number(ord.delivery_charge || 0) - Number(ord.discount || 0));
+    setEditingOrder({
+      ...ord,
+      items: clonedItems,
+    });
+    setCustomOrderTotal(ord.total !== calcTotal ? ord.total : null);
+    setAddItemProductId(products[0]?.id || '');
+  };
+
   /* ---------------- derived ---------------- */
   const filteredOrders = orders.filter((o) => {
     const matchStatus = orderStatusFilter === 'all' ? o.status !== 'cancelled' : o.status === orderStatusFilter;
     const q = orderSearchQuery.trim().toLowerCase();
-    const matchSearch = q ? o.order_number.toLowerCase().includes(q) || o.customer_name.toLowerCase().includes(q) || o.phone.includes(orderSearchQuery) : true;
+    const matchItemName = q ? (o.items || []).some((it) => (it.product_name || '').toLowerCase().includes(q)) : false;
+    const matchSearch = q ? o.order_number.toLowerCase().includes(q) || o.customer_name.toLowerCase().includes(q) || o.phone.includes(orderSearchQuery) || matchItemName : true;
     return matchStatus && matchSearch;
   });
   const totalRevenue = orders.reduce((s, o) => (o.status !== 'cancelled' ? s + o.total : s), 0);
@@ -699,12 +729,27 @@ export const AdminDashboard: React.FC = () => {
           {activeTab === 'orders' && (
             <div className="space-y-4">
               <div className="space-y-2.5">
-                <div className="relative">
-                  <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input type="text" value={orderSearchQuery} onChange={(e) => setOrderSearchQuery(e.target.value)} placeholder="অর্ডার খুঁজুন (নাম, মোবাইল, অর্ডার নং)..." className={`${inputCls} pl-9 pr-8`} />
-                  {orderSearchQuery && (
-                    <button onClick={() => setOrderSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs font-bold cursor-pointer" aria-label="সার্চ মুছুন">✕</button>
-                  )}
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input type="text" value={orderSearchQuery} onChange={(e) => setOrderSearchQuery(e.target.value)} placeholder="অর্ডার খুঁজুন (নাম, মোবাইল, অর্ডার নং)..." className={`${inputCls} pl-9 pr-8`} />
+                    {orderSearchQuery && (
+                      <button onClick={() => setOrderSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs font-bold cursor-pointer" aria-label="সার্চ মুছুন">✕</button>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isOrdersSyncing}
+                    onClick={async () => {
+                      await refreshOrders(false);
+                      showToast('✓ ডাটাবেজ থেকে অর্ডার তালিকা আপডেট করা হয়েছে');
+                    }}
+                    className="shrink-0 px-3.5 py-2.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-[#185824] rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    title="ডাটাবেজ থেকে নতুন অর্ডার রিফ্রেশ করুন"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isOrdersSyncing ? 'animate-spin' : ''}`} />
+                    <span className="hidden sm:inline">{isOrdersSyncing ? 'সিঙ্ক হচ্ছে...' : 'রিফ্রেশ'}</span>
+                  </button>
                 </div>
                 <div className={`flex items-center gap-2 overflow-x-auto pb-1 ${hideScrollbar}`}>
                   {['all', 'pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'].map((st) => (
@@ -716,7 +761,7 @@ export const AdminDashboard: React.FC = () => {
                 </div>
               </div>
 
-              <div className="space-y-3">
+              <div className="space-y-3.5">
                 {filteredOrders.length === 0 ? (
                   <div className="py-16 text-center text-gray-400 text-xs rounded-2xl border border-dashed border-gray-200 px-3">
                     <ShoppingBag className="w-9 h-9 text-gray-300 mx-auto mb-2" />
@@ -724,88 +769,195 @@ export const AdminDashboard: React.FC = () => {
                     <p className="mt-0.5">নতুন অর্ডার এলে এখানে দেখা যাবে</p>
                   </div>
                 ) : (
-                  filteredOrders.map((ord) => (
-                    <div key={`${ord.id}-${ord.status}`} className="rounded-2xl border border-gray-100 bg-white shadow-xs hover:shadow-md hover:border-emerald-300 transition-all overflow-hidden min-w-0">
-                      <div className="p-3 sm:p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-3 bg-gradient-to-r from-emerald-50/70 to-white border-b border-gray-100">
-                        <div className="flex flex-wrap items-center gap-2 min-w-0">
-                          <span className="font-mono font-black text-sm text-[#185824] bg-white border border-emerald-200 px-2.5 py-1 rounded-lg">{ord.order_number}</span>
-                          <span className={`text-[10px] font-black uppercase px-2 py-1 rounded-full ${STATUS_STYLE[ord.status] || 'bg-gray-100 text-gray-600'}`}>{ord.status}</span>
-                          <span className="text-xs font-bold text-gray-900 truncate max-w-[180px] sm:max-w-none">{ord.customer_name}</span>
-                          <a href={`tel:${ord.phone}`} className="text-xs font-mono font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg hover:bg-emerald-100 flex items-center gap-1">
-                            <Phone className="w-3 h-3" /><span>{ord.phone}</span>
-                          </a>
-                          <a
-                            href={`https://wa.me/88${ord.phone.replace(/^0+/, '')}?text=${encodeURIComponent(`আসসালামু আলাইকুম ${ord.customer_name}, Tuktak Shopping থেকে আপনার অর্ডার (${ord.order_number}) এর বিষয়ে যোগাযোগ করা হয়েছে।`)}`}
-                            target="_blank" rel="noopener noreferrer"
-                            className="text-xs font-bold text-emerald-600 bg-emerald-50 hover:bg-emerald-100 p-1.5 rounded-lg flex items-center" aria-label="WhatsApp"
-                          >
-                            <MessageCircle className="w-4 h-4" />
-                          </a>
+                  filteredOrders.map((ord) => {
+                    const totalQty = (ord.items || []).reduce((sum, it) => sum + Number(it.quantity || 0), 0);
+                    return (
+                      <div key={`${ord.id}-${ord.status}`} className="rounded-2xl border border-gray-200/90 bg-white shadow-xs hover:shadow-md hover:border-emerald-300 transition-all overflow-hidden min-w-0">
+                        {/* Order Card Top Header */}
+                        <div className="p-3 sm:p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-3 bg-gradient-to-r from-emerald-50/70 to-white border-b border-gray-100">
+                          <div className="flex flex-wrap items-center gap-2 min-w-0">
+                            <span className="font-mono font-black text-sm text-[#185824] bg-white border border-emerald-200 px-2.5 py-1 rounded-lg">{ord.order_number}</span>
+                            <span className={`text-[10px] font-black uppercase px-2 py-1 rounded-md ${STATUS_STYLE[ord.status] || 'bg-gray-100 text-gray-600'}`}>{ord.status}</span>
+                            <span className="text-xs font-bold text-gray-900 truncate max-w-[180px] sm:max-w-none">{ord.customer_name}</span>
+                            <a href={`tel:${ord.phone}`} className="text-xs font-mono font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg hover:bg-emerald-100 flex items-center gap-1">
+                              <Phone className="w-3 h-3" /><span>{ord.phone}</span>
+                            </a>
+                            <a
+                              href={`https://wa.me/88${ord.phone.replace(/^0+/, '')}?text=${encodeURIComponent(`আসসালামু আলাইকুম ${ord.customer_name}, Tuktak Shopping থেকে আপনার অর্ডার (${ord.order_number}) এর বিষয়ে যোগাযোগ করা হয়েছে।`)}`}
+                              target="_blank" rel="noopener noreferrer"
+                              className="text-xs font-bold text-emerald-600 bg-emerald-50 hover:bg-emerald-100 p-1.5 rounded-lg flex items-center" aria-label="WhatsApp"
+                            >
+                              <MessageCircle className="w-4 h-4" />
+                            </a>
+                            <span className="text-[11px] text-gray-400 font-mono hidden sm:inline">
+                              · {new Date(ord.created_at).toLocaleString('bn-BD', { dateStyle: 'medium', timeStyle: 'short' })}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => openEditOrderModal(ord)}
+                              className="px-3 py-2 bg-[#185824] hover:bg-[#12431C] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs"
+                              title="অর্ডার এডিট করুন (নাম, ফোন, ঠিকানা, দাম ও পণ্য)"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                              <span>এডিট</span>
+                            </button>
+                            <button onClick={() => setViewInvoiceOrder(ord)} className="p-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl cursor-pointer" aria-label="ইনভয়েস" title="মেমো প্রিন্ট করুন">
+                              <Printer className="w-4 h-4" />
+                            </button>
+                            <button onClick={() => setOrderToDelete(ord)} className="p-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl cursor-pointer" aria-label="অর্ডার মুছুন" title="অর্ডার মুছুন">
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                            <select
+                              value={ord.status}
+                              onChange={async (e) => { await updateOrderStatus(ord.id, e.target.value as OrderStatus); }}
+                              className="flex-1 sm:flex-none text-xs font-bold bg-white border border-emerald-200 rounded-xl px-2.5 py-2.5 text-gray-900 cursor-pointer"
+                            >
+                              <option value="pending">Pending (অপেক্ষমান)</option>
+                              <option value="confirmed">Confirmed (নিশ্চিত)</option>
+                              <option value="processing">Processing (প্যাকেজিং)</option>
+                              <option value="shipped">Shipped (কুরিয়ারে)</option>
+                              <option value="delivered">Delivered (ডেলিভার্ড)</option>
+                              <option value="cancelled">Cancelled (বাতিল)</option>
+                            </select>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <button onClick={() => setViewInvoiceOrder(ord)} className="p-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl cursor-pointer" aria-label="ইনভয়েস">
-                            <Printer className="w-4 h-4" />
-                          </button>
-                          <button onClick={() => setOrderToDelete(ord)} className="p-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl cursor-pointer" aria-label="অর্ডার মুছুন">
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                          <select
-                            value={ord.status}
-                            onChange={async (e) => { await updateOrderStatus(ord.id, e.target.value as OrderStatus); }}
-                            className="flex-1 xl:flex-none text-xs font-bold bg-white border border-emerald-200 rounded-xl px-2.5 py-2.5 text-gray-900 cursor-pointer"
-                          >
-                            <option value="pending">Pending (অপেক্ষমান)</option>
-                            <option value="confirmed">Confirmed (নিশ্চিত)</option>
-                            <option value="processing">Processing (প্যাকেজিং)</option>
-                            <option value="shipped">Shipped (কুরিয়ারে)</option>
-                            <option value="delivered">Delivered (ডেলিভার্ড)</option>
-                            <option value="cancelled">Cancelled (বাতিল)</option>
-                          </select>
-                        </div>
-                      </div>
 
-                      <div className="p-3 sm:p-4 grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs text-gray-600">
-                        <div className="space-y-1 bg-gray-50/70 p-3 rounded-xl min-w-0">
-                          <span className="text-[10px] text-gray-400 font-bold block uppercase tracking-wider">ডেলিভারি ঠিকানা</span>
-                          <p className="font-semibold text-gray-800 leading-snug break-words">{ord.address}</p>
-                          <span className="inline-block text-[#185824] text-[11px] font-bold bg-emerald-50 px-2 py-0.5 rounded-md">📍 {ord.delivery_zone} · ফি ৳{ord.delivery_charge}</span>
-                        </div>
-                        <div className="space-y-1 bg-gray-50/70 p-3 rounded-xl min-w-0">
-                          <span className="text-[10px] text-gray-400 font-bold block uppercase tracking-wider">আইটেম</span>
-                          <div className="space-y-1 max-h-28 overflow-y-auto">
-                            {ord.items.map((it, idx) => (
-                              <div key={idx} className="flex justify-between items-start gap-2 text-[11px] font-medium py-0.5 border-b border-gray-100 last:border-none">
-                                <span className="min-w-0 break-words">• {it.product_name} {it.variant ? `(${it.variant})` : ''}</span>
-                                <span className="font-mono font-bold text-gray-700 whitespace-nowrap">×{it.quantity} = ৳{(it.unit_price * it.quantity).toLocaleString()}</span>
+                        {/* Order Details Grid: Prominent Ordered Products + Address + Bill/Tracking */}
+                        <div className="p-3 sm:p-4 grid grid-cols-1 lg:grid-cols-12 gap-3 text-xs text-gray-600">
+                          {/* Column 1: Ordered Products with Images (5 cols on desktop) */}
+                          <div className="lg:col-span-5 space-y-2 bg-emerald-50/35 border border-emerald-100/80 p-3 rounded-xl min-w-0">
+                            <div className="flex items-center justify-between text-[11px] font-bold text-gray-700">
+                              <span>অর্ডারকৃত পণ্য ({ord.items.length} টি আইটেম · মোট {totalQty} পিস)</span>
+                              <button
+                                type="button"
+                                onClick={() => openEditOrderModal(ord)}
+                                className="text-[#185824] hover:underline cursor-pointer text-[11px]"
+                              >
+                                পরিবর্তন করুন
+                              </button>
+                            </div>
+
+                            {ord.items.length === 0 ? (
+                              <div className="py-4 text-center text-gray-400 text-[11px]">
+                                কোনো পণ্যের তথ্য নেই — এডিট বাটনে ক্লিক করে পণ্য যুক্ত করুন
                               </div>
-                            ))}
+                            ) : (
+                              <div className="space-y-2 max-h-52 overflow-y-auto pr-0.5">
+                                {ord.items.map((it, idx) => {
+                                  const { imgUrl, secondaryName } = resolveOrderItemDetails(it);
+                                  const lineTotal = Number(it.unit_price || 0) * Number(it.quantity || 1);
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className="flex items-center gap-2.5 p-2 rounded-xl bg-white border border-gray-100"
+                                    >
+                                      <img
+                                        src={imgUrl}
+                                        alt={it.product_name}
+                                        className="w-12 h-12 sm:w-14 sm:h-14 rounded-lg object-cover border border-gray-200 bg-gray-50 shrink-0"
+                                        referrerPolicy="no-referrer"
+                                      />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs font-bold text-gray-900 leading-snug break-words">
+                                          {it.product_name}
+                                        </p>
+                                        {secondaryName && (
+                                          <p className="text-[11px] text-gray-500 truncate">{secondaryName}</p>
+                                        )}
+                                        <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[11px] text-gray-600 font-mono">
+                                          <span>৳{Number(it.unit_price || 0).toLocaleString()}</span>
+                                          <span>×</span>
+                                          <span className="font-black text-[#185824]">{it.quantity} পিস</span>
+                                          {it.variant && (
+                                            <span className="font-sans text-gray-500">· {it.variant}</span>
+                                          )}
+                                        </div>
+                                      </div>
+                                      <div className="text-right shrink-0">
+                                        <span className="font-mono font-black text-xs sm:text-sm text-gray-900">
+                                          ৳{lineTotal.toLocaleString()}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
-                        </div>
-                        <div className="space-y-2 bg-gray-50/70 p-3 rounded-xl flex flex-col justify-between min-w-0">
-                          <div>
-                            <span className="text-[10px] text-gray-400 font-bold block uppercase tracking-wider">কুরিয়ার ট্র্যাকিং কোড</span>
-                            <input
-                              type="text" defaultValue={ord.courier_tracking_id || ''} placeholder="e.g. PTH-98214"
-                              onBlur={(e) => {
-                                if (e.target.value !== (ord.courier_tracking_id || '')) {
-                                  updateOrderStatus(ord.id, ord.status, e.target.value);
-                                  showToast('ট্র্যাকিং কোড আপডেট হয়েছে');
-                                }
-                              }}
-                              className="mt-1 px-2.5 py-2.5 sm:py-1.5 bg-white border border-gray-200 rounded-lg text-base sm:text-xs font-mono w-full focus:outline-hidden focus:ring-2 focus:ring-[#185824]"
-                            />
+
+                          {/* Column 2: Delivery Address & Customer Note (4 cols on desktop) */}
+                          <div className="lg:col-span-4 space-y-2 bg-gray-50/70 p-3 rounded-xl flex flex-col justify-between min-w-0">
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[11px] text-gray-500 font-bold">ডেলিভারি ঠিকানা</span>
+                                <button
+                                  type="button"
+                                  onClick={() => openEditOrderModal(ord)}
+                                  className="text-[11px] font-bold text-[#185824] hover:underline cursor-pointer"
+                                >
+                                  ঠিকানা এডিট
+                                </button>
+                              </div>
+                              <p className="font-bold text-gray-900 text-xs sm:text-sm leading-snug break-words">
+                                {ord.address}
+                              </p>
+                              <p className="text-[11px] text-[#185824] font-bold pt-0.5">
+                                {ord.delivery_zone} · ডেলিভারি চার্জ ৳{ord.delivery_charge}
+                              </p>
+                            </div>
+                            {ord.note && (
+                              <div className="pt-2 border-t border-gray-200/80 text-[11px] text-amber-900">
+                                <span className="font-bold">নোট:</span> {ord.note}
+                              </div>
+                            )}
                           </div>
-                          <div className="pt-2 border-t border-gray-200 flex items-center justify-between gap-2">
-                            <span className="text-[10px] text-gray-500">ক্যাশ অন ডেলিভারি</span>
-                            <div className="text-right">
-                              <span className="text-[10px] text-gray-400 block">সর্বমোট</span>
-                              <span className="font-mono font-black text-base text-[#1F1F24]">৳{ord.total.toLocaleString()}</span>
+
+                          {/* Column 3: Courier Tracking & Full Price Breakdown (3 cols on desktop) */}
+                          <div className="lg:col-span-3 space-y-2.5 bg-gray-50/70 p-3 rounded-xl flex flex-col justify-between min-w-0">
+                            <div>
+                              <span className="text-[11px] text-gray-500 font-bold block">কুরিয়ার ট্র্যাকিং কোড</span>
+                              <input
+                                type="text"
+                                key={`${ord.id}-${ord.courier_tracking_id || ''}`}
+                                defaultValue={ord.courier_tracking_id || ''}
+                                placeholder="e.g. PTH-98214"
+                                onBlur={(e) => {
+                                  if (e.target.value !== (ord.courier_tracking_id || '')) {
+                                    updateOrderStatus(ord.id, ord.status, e.target.value);
+                                    showToast('ট্র্যাকিং কোড আপডেট হয়েছে');
+                                  }
+                                }}
+                                className="mt-1 px-2.5 py-2 sm:py-1.5 bg-white border border-gray-200 rounded-lg text-base sm:text-xs font-mono w-full focus:outline-hidden focus:ring-2 focus:ring-[#185824]"
+                              />
+                            </div>
+
+                            <div className="pt-2 border-t border-gray-200 space-y-1 text-[11px]">
+                              <div className="flex justify-between text-gray-500">
+                                <span>সাবটোটাল:</span>
+                                <span className="font-mono font-semibold text-gray-800">৳{ord.subtotal.toLocaleString()}</span>
+                              </div>
+                              <div className="flex justify-between text-gray-500">
+                                <span>ডেলিভারি ফি:</span>
+                                <span className="font-mono font-semibold text-gray-800">৳{ord.delivery_charge.toLocaleString()}</span>
+                              </div>
+                              {ord.discount > 0 && (
+                                <div className="flex justify-between text-emerald-700 font-bold">
+                                  <span>ডিসকাউন্ট:</span>
+                                  <span className="font-mono">-৳{ord.discount.toLocaleString()}</span>
+                                </div>
+                              )}
+                              <div className="pt-1.5 border-t border-gray-200 flex items-baseline justify-between gap-2">
+                                <span className="text-[11px] font-bold text-gray-700">সর্বমোট (COD):</span>
+                                <span className="font-mono font-black text-base text-[#185824]">৳{ord.total.toLocaleString()}</span>
+                              </div>
                             </div>
                           </div>
                         </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -1152,6 +1304,398 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
+      {/* Edit Order Modal */}
+      {editingOrder && (() => {
+        const editSubtotal = editingOrder.items.reduce(
+          (sum, it) => sum + Math.max(0, Number(it.unit_price) || 0) * Math.max(1, Number(it.quantity) || 1),
+          0
+        );
+        const autoTotal = Math.max(
+          0,
+          editSubtotal + Math.max(0, Number(editingOrder.delivery_charge) || 0) - Math.max(0, Number(editingOrder.discount) || 0)
+        );
+        const finalPayable = customOrderTotal !== null ? customOrderTotal : autoTotal;
+
+        const handleUpdateEditItem = (index: number, patch: Partial<OrderItem>) => {
+          setEditingOrder((prev) => {
+            if (!prev) return null;
+            const nextItems = prev.items.map((item, i) => {
+              if (i !== index) return item;
+              const updated = { ...item, ...patch };
+              const q = Math.max(1, Number(updated.quantity) || 1);
+              const u = Math.max(0, Number(updated.unit_price) || 0);
+              return { ...updated, quantity: q, unit_price: u, total: q * u };
+            });
+            return { ...prev, items: nextItems };
+          });
+          setCustomOrderTotal(null);
+        };
+
+        const handleRemoveEditItem = (index: number) => {
+          setEditingOrder((prev) => {
+            if (!prev) return null;
+            return { ...prev, items: prev.items.filter((_, i) => i !== index) };
+          });
+          setCustomOrderTotal(null);
+        };
+
+        const handleAddProductToOrder = () => {
+          const prod = products.find((p) => p.id === addItemProductId) || products[0];
+          if (!prod) return showToast('যোগ করার মতো কোনো পণ্য পাওয়া যায়নি');
+          setEditingOrder((prev) => {
+            if (!prev) return null;
+            const existingIdx = prev.items.findIndex((it) => it.product_id === prod.id);
+            if (existingIdx > -1) {
+              const nextItems = prev.items.map((it, idx) =>
+                idx === existingIdx
+                  ? { ...it, quantity: it.quantity + 1, total: (it.quantity + 1) * it.unit_price }
+                  : it
+              );
+              return { ...prev, items: nextItems };
+            }
+            return {
+              ...prev,
+              items: [
+                ...prev.items,
+                {
+                  product_id: prod.id,
+                  product_name: prod.name,
+                  quantity: 1,
+                  unit_price: prod.price,
+                  total: prod.price,
+                  image_url: prod.image_url,
+                },
+              ],
+            };
+          });
+          setCustomOrderTotal(null);
+        };
+
+        const handleSaveOrderChanges = async (e: React.FormEvent) => {
+          e.preventDefault();
+          if (!editingOrder.customer_name.trim() || !editingOrder.phone.trim() || !editingOrder.address.trim()) {
+            showToast('গ্রাহকের নাম, মোবাইল নম্বর এবং ঠিকানা ফাঁকা রাখা যাবে না');
+            return;
+          }
+          if (editingOrder.items.length === 0) {
+            showToast('অর্ডারে অন্তত ১টি পণ্য থাকতে হবে');
+            return;
+          }
+          setIsSavingOrder(true);
+          try {
+            const ok = await updateOrder({
+              ...editingOrder,
+              subtotal: editSubtotal,
+              total: finalPayable,
+            });
+            if (ok) {
+              setEditingOrder(null);
+              setCustomOrderTotal(null);
+            }
+          } finally {
+            setIsSavingOrder(false);
+          }
+        };
+
+        return (
+          <div className={`${modalOverlay} z-[75]`}>
+            <form onSubmit={handleSaveOrderChanges} className={`${modalPanel} sm:max-w-2xl shadow-2xl`}>
+              <div className="flex items-center justify-between pb-3 border-b border-gray-100">
+                <div>
+                  <h4 className="text-sm sm:text-base font-black text-gray-900">
+                    অর্ডার সম্পাদনা — <span className="font-mono text-[#185824]">{editingOrder.order_number}</span>
+                  </h4>
+                  <p className="text-[11px] text-gray-500">
+                    গ্রাহকের নাম, ফোন, ঠিকানা, পণ্যের পরিমাণ ও মূল্য পরিবর্তন করে সেভ করুন
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEditingOrder(null)}
+                  className="p-1.5 text-gray-400 hover:text-gray-700 cursor-pointer"
+                  aria-label="বন্ধ"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4 text-xs">
+                {/* Customer & Address Fields */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">গ্রাহকের নাম *</label>
+                    <input
+                      type="text"
+                      required
+                      value={editingOrder.customer_name}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, customer_name: e.target.value })}
+                      className={inputCls}
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">মোবাইল নম্বর *</label>
+                    <input
+                      type="tel"
+                      required
+                      value={editingOrder.phone}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, phone: e.target.value })}
+                      className={`${inputCls} font-mono`}
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="font-bold text-gray-700 block mb-1">ডেলিভারি ঠিকানা *</label>
+                    <textarea
+                      rows={2}
+                      required
+                      value={editingOrder.address}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, address: e.target.value })}
+                      className={inputCls}
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">ডেলিভারি এলাকা</label>
+                    <select
+                      value={editingOrder.delivery_zone}
+                      onChange={(e) => {
+                        const z = deliveryZones.find((dz) => dz.name_bn === e.target.value);
+                        setEditingOrder({
+                          ...editingOrder,
+                          delivery_zone: e.target.value,
+                          delivery_charge: z ? z.charge : editingOrder.delivery_charge,
+                        });
+                        setCustomOrderTotal(null);
+                      }}
+                      className={inputCls}
+                    >
+                      {!deliveryZones.some((dz) => dz.name_bn === editingOrder.delivery_zone) && (
+                        <option value={editingOrder.delivery_zone}>{editingOrder.delivery_zone}</option>
+                      )}
+                      {deliveryZones.map((dz) => (
+                        <option key={dz.id} value={dz.name_bn}>
+                          {dz.name_bn} (৳{dz.charge})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">অর্ডার স্ট্যাটাস</label>
+                    <select
+                      value={editingOrder.status}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, status: e.target.value as OrderStatus })}
+                      className={`${inputCls} font-bold`}
+                    >
+                      <option value="pending">Pending (অপেক্ষমান)</option>
+                      <option value="confirmed">Confirmed (নিশ্চিত)</option>
+                      <option value="processing">Processing (প্যাকেজিং)</option>
+                      <option value="shipped">Shipped (কুরিয়ারে)</option>
+                      <option value="delivered">Delivered (ডেলিভার্ড)</option>
+                      <option value="cancelled">Cancelled (বাতিল)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Ordered Products Editor */}
+                <div className="space-y-2.5 pt-2 border-t border-gray-100">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-black text-gray-900">অর্ডারকৃত পণ্যসমূহ ({editingOrder.items.length})</span>
+                    {products.length > 0 && (
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={addItemProductId}
+                          onChange={(e) => setAddItemProductId(e.target.value)}
+                          className="px-2.5 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs max-w-[180px]"
+                        >
+                          {products.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name} (৳{p.price})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={handleAddProductToOrder}
+                          className="px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-[#185824] font-bold rounded-lg text-xs flex items-center gap-1 cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>পণ্য যোগ</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    {editingOrder.items.map((it, idx) => {
+                      const { imgUrl } = resolveOrderItemDetails(it);
+                      return (
+                        <div key={idx} className="p-2.5 rounded-xl border border-gray-200 bg-gray-50/60 flex flex-col sm:flex-row sm:items-center gap-2.5">
+                          <div className="flex items-center gap-2.5 flex-1 min-w-0">
+                            <img src={imgUrl} alt={it.product_name} className="w-11 h-11 rounded-lg object-cover border border-gray-200 bg-white shrink-0" referrerPolicy="no-referrer" />
+                            <div className="flex-1 min-w-0 space-y-1">
+                              <input
+                                type="text"
+                                value={it.product_name}
+                                onChange={(e) => handleUpdateEditItem(idx, { product_name: e.target.value })}
+                                className="w-full px-2 py-1 bg-white border border-gray-200 rounded-lg text-xs font-bold text-gray-900"
+                              />
+                              <input
+                                type="text"
+                                value={it.variant || ''}
+                                onChange={(e) => handleUpdateEditItem(idx, { variant: e.target.value })}
+                                placeholder="ভ্যারিয়েন্ট / ওজন (ঐচ্ছিক)"
+                                className="w-full px-2 py-1 bg-white border border-gray-200 rounded-lg text-[11px] text-gray-600"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-between sm:justify-end gap-2">
+                            {/* Quantity Stepper */}
+                            <div className="flex items-center bg-white border border-gray-200 rounded-lg px-1 py-0.5">
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateEditItem(idx, { quantity: Math.max(1, it.quantity - 1) })}
+                                className="p-1 text-gray-500 hover:text-gray-900 cursor-pointer"
+                              >
+                                <Minus className="w-3 h-3" />
+                              </button>
+                              <input
+                                type="number"
+                                min={1}
+                                value={it.quantity}
+                                onChange={(e) => handleUpdateEditItem(idx, { quantity: Math.max(1, Number(e.target.value) || 1) })}
+                                className="w-10 text-center font-mono font-bold text-xs focus:outline-hidden"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateEditItem(idx, { quantity: it.quantity + 1 })}
+                                className="p-1 text-gray-500 hover:text-gray-900 cursor-pointer"
+                              >
+                                <Plus className="w-3 h-3" />
+                              </button>
+                            </div>
+
+                            {/* Unit Price */}
+                            <div className="w-24">
+                              <span className="text-[10px] text-gray-400 block leading-none mb-0.5">একক দাম (৳)</span>
+                              <input
+                                type="number"
+                                min={0}
+                                value={it.unit_price}
+                                onChange={(e) => handleUpdateEditItem(idx, { unit_price: Math.max(0, Number(e.target.value) || 0) })}
+                                className="w-full px-2 py-1 bg-white border border-gray-200 rounded-lg font-mono font-bold text-xs text-right"
+                              />
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveEditItem(idx)}
+                              className="p-2 text-red-500 hover:bg-red-50 rounded-lg cursor-pointer"
+                              title="আইটেম সরান"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Pricing, Discount, Tracking & Notes */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-gray-100">
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">ডেলিভারি চার্জ (৳)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={editingOrder.delivery_charge}
+                      onChange={(e) => {
+                        setEditingOrder({ ...editingOrder, delivery_charge: Math.max(0, Number(e.target.value) || 0) });
+                        setCustomOrderTotal(null);
+                      }}
+                      className={`${inputCls} font-mono`}
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">ডিসকাউন্ট / ছাড় (৳)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={editingOrder.discount}
+                      onChange={(e) => {
+                        setEditingOrder({ ...editingOrder, discount: Math.max(0, Number(e.target.value) || 0) });
+                        setCustomOrderTotal(null);
+                      }}
+                      className={`${inputCls} font-mono`}
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-[#185824] block mb-1">সর্বমোট বিল / COD (৳)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={finalPayable}
+                      onChange={(e) => setCustomOrderTotal(Math.max(0, Number(e.target.value) || 0))}
+                      className={`${inputCls} font-mono font-black text-[#185824] border-emerald-300 bg-emerald-50/40`}
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">কুরিয়ার ট্র্যাকিং কোড</label>
+                    <input
+                      type="text"
+                      value={editingOrder.courier_tracking_id || ''}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, courier_tracking_id: e.target.value })}
+                      placeholder="e.g. PTH-98214"
+                      className={`${inputCls} font-mono`}
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-gray-700 block mb-1">অ্যাডমিন / ডেলিভারি নোট</label>
+                    <input
+                      type="text"
+                      value={editingOrder.note || ''}
+                      onChange={(e) => setEditingOrder({ ...editingOrder, note: e.target.value })}
+                      placeholder="বিশেষ নির্দেশনা লিখুন..."
+                      className={inputCls}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className={modalFooter}>
+                <button
+                  type="submit"
+                  disabled={isSavingOrder}
+                  className="flex-1 py-3 bg-[#185824] hover:bg-[#12431C] disabled:opacity-60 text-white font-bold rounded-xl text-xs cursor-pointer flex items-center justify-center gap-2 shadow-sm"
+                >
+                  {isSavingOrder ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>সেভ হচ্ছে...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Save className="w-4 h-4" />
+                      <span>পরিবর্তন সেভ করুন (৳{finalPayable.toLocaleString()})</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  disabled={isSavingOrder}
+                  onClick={() => setEditingOrder(null)}
+                  className="py-3 px-5 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl text-xs cursor-pointer"
+                >
+                  বাতিল
+                </button>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
+
       {/* Invoice modal */}
       {viewInvoiceOrder && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center sm:p-4">
@@ -1175,20 +1719,29 @@ export const AdminDashboard: React.FC = () => {
                 <p><strong>গ্রাহক:</strong> {viewInvoiceOrder.customer_name}</p>
                 <p><strong>মোবাইল:</strong> +88 {viewInvoiceOrder.phone}</p>
                 <p><strong>ঠিকানা:</strong> {viewInvoiceOrder.address} ({viewInvoiceOrder.delivery_zone})</p>
+                {viewInvoiceOrder.note && <p><strong>নোট:</strong> {viewInvoiceOrder.note}</p>}
               </div>
               <div className="border border-gray-200 rounded-xl overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-gray-100 text-gray-700 font-bold">
-                    <tr><th className="p-2.5">আইটেম</th><th className="p-2.5 text-center">পরিমাণ</th><th className="p-2.5 text-right">মূল্য</th></tr>
+                    <tr><th className="p-2.5">পণ্য</th><th className="p-2.5 text-center">দাম × পরিমাণ</th><th className="p-2.5 text-right">মোট</th></tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
-                    {viewInvoiceOrder.items.map((it, idx) => (
-                      <tr key={idx}>
-                        <td className="p-2.5 font-medium">{it.product_name} {it.variant ? `(${it.variant})` : ''}</td>
-                        <td className="p-2.5 text-center font-mono">{it.quantity}</td>
-                        <td className="p-2.5 text-right font-mono font-bold whitespace-nowrap">৳{(it.unit_price * it.quantity).toLocaleString()}</td>
-                      </tr>
-                    ))}
+                    {viewInvoiceOrder.items.map((it, idx) => {
+                      const { imgUrl } = resolveOrderItemDetails(it);
+                      return (
+                        <tr key={idx}>
+                          <td className="p-2.5 font-medium">
+                            <div className="flex items-center gap-2">
+                              <img src={imgUrl} alt={it.product_name} className="w-8 h-8 rounded object-cover border border-gray-200 shrink-0" referrerPolicy="no-referrer" />
+                              <span>{it.product_name} {it.variant ? `(${it.variant})` : ''}</span>
+                            </div>
+                          </td>
+                          <td className="p-2.5 text-center font-mono whitespace-nowrap">৳{it.unit_price} × {it.quantity}</td>
+                          <td className="p-2.5 text-right font-mono font-bold whitespace-nowrap">৳{(it.unit_price * it.quantity).toLocaleString()}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

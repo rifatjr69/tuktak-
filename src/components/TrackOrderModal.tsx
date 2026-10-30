@@ -2,12 +2,14 @@ import React, { useState } from 'react';
 import { X, Search, PackageCheck, Copy } from 'lucide-react';
 import { useStore } from '../context/StoreContext';
 import { Order, OrderStatus } from '../types';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 export const TrackOrderModal: React.FC = () => {
   const { isTrackOrderOpen, closeTrackOrder, trackOrderQuery, orders, showToast } = useStore();
 
   const [orderQuery, setOrderQuery] = useState(trackOrderQuery || '');
   const [phoneQuery, setPhoneQuery] = useState('');
+  const [isSearchingDb, setIsSearchingDb] = useState(false);
   const [searchedOrder, setSearchedOrder] = useState<Order | null>(() => {
     if (trackOrderQuery) {
       return (
@@ -33,19 +35,52 @@ export const TrackOrderModal: React.FC = () => {
 
   if (!isTrackOrderOpen) return null;
 
-  const handleSearch = (e: React.FormEvent) => {
+  const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     setHasSearched(true);
     const cleanNum = orderQuery.trim().toUpperCase();
     const cleanPh = phoneQuery.trim().replace(/\D/g, '');
 
-    const found = orders.find((o) => {
+    const foundLocal = orders.find((o) => {
       const numMatch = cleanNum ? o.order_number.toUpperCase().includes(cleanNum) : false;
       const phoneMatch = cleanPh ? o.phone.includes(cleanPh) : false;
       return cleanNum && cleanPh ? numMatch && phoneMatch : numMatch || phoneMatch;
     });
 
-    setSearchedOrder(found || null);
+    if (foundLocal) {
+      setSearchedOrder(foundLocal);
+      return;
+    }
+
+    if (isSupabaseConfigured && supabase && (cleanNum || cleanPh)) {
+      try {
+        setIsSearchingDb(true);
+        let q = supabase
+          .from('orders')
+          .select('*, order_items(*)')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (cleanNum) q = q.ilike('order_number', `%${cleanNum}%`);
+        if (cleanPh) q = q.ilike('phone', `%${cleanPh}%`);
+
+        const { data } = await q;
+        if (data && data.length > 0) {
+          const row: any = data[0];
+          setSearchedOrder({
+            ...row,
+            items: row.order_items || [],
+          });
+          return;
+        }
+      } catch {
+        // ignore if RLS restricts guest SELECT
+      } finally {
+        setIsSearchingDb(false);
+      }
+    }
+
+    setSearchedOrder(null);
   };
 
   const copyToClipboard = (text: string) => {
@@ -109,7 +144,7 @@ export const TrackOrderModal: React.FC = () => {
                   type="text"
                   value={orderQuery}
                   onChange={(e) => setOrderQuery(e.target.value)}
-                  placeholder="e.g. LH-1001"
+                  placeholder="e.g. TK-482910"
                   className="w-full px-3 py-2 bg-pink-50/40 border border-pink-200 rounded-xl text-xs font-mono uppercase focus:outline-hidden focus:ring-2 focus:ring-[#F8628D]"
                 />
               </div>
@@ -149,10 +184,11 @@ export const TrackOrderModal: React.FC = () => {
 
               <button
                 type="submit"
-                className="px-5 py-2 bg-[#1F1F24] hover:bg-black text-white text-xs font-bold rounded-xl flex items-center gap-1.5 cursor-pointer shadow-xs"
+                disabled={isSearchingDb}
+                className="px-5 py-2 bg-[#1F1F24] hover:bg-black disabled:opacity-60 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 cursor-pointer shadow-xs"
               >
                 <Search className="w-3.5 h-3.5" />
-                <span>ট্র্যাক করুন</span>
+                <span>{isSearchingDb ? 'খুঁজছে...' : 'ট্র্যাক করুন'}</span>
               </button>
             </div>
           </form>
